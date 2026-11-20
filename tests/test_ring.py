@@ -200,3 +200,18 @@ def test_no_torn_frame_is_ever_reported_valid(name, use_views):
     stale = sum(r[1] for r in results)
     print(f"\n  views={use_views}: {count.value} written, {ok} good, {stale} stale, {torn} torn", file=sys.stderr)
     assert torn == 0 and ok > 0
+
+
+def test_attaching_never_registers_with_the_resource_tracker(name, monkeypatch):
+    # registering then unregistering broke the writer's own registration on Python < 3.13
+    # when writer and reader share a process (KeyError printed by the tracker on close)
+    from multiprocessing import resource_tracker
+
+    from maia_ring import _shm
+
+    with RingWriter(name, slots=2, width=8, height=8):
+        calls = []
+        monkeypatch.setattr(resource_tracker, "register", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(resource_tracker, "unregister", lambda *a, **k: calls.append(a))
+        _shm.attach(name).close()
+        assert calls == []

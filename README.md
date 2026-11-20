@@ -63,7 +63,7 @@ mid-read and the read is retried (newest frame) or reported as `StaleFrame` (a s
 frame). Views follow the same rule: use the data, then call `still_valid()`.
 
 The test suite proves it: a writer in one process laps two readers in others through a
-3-slot ring at about 70,000 frames a second. Every frame a reader accepts is checked
+3-slot ring at 70,000 to 190,000 frames a second (x86 VM and Apple Silicon). Every frame a reader accepts is checked
 pixel by pixel; none is torn. With the seqlock disabled the same test catches hundreds of
 torn frames, so it is a real check, not a lucky one.
 
@@ -83,13 +83,16 @@ Details that are easy to get wrong, handled here:
 
 ## Cost per frame
 
-`maia-ring bench` on the machine you run it on. Example, a 2-core x86 cloud VM, BGR uint8:
+`maia-ring bench` on the machine you run it on, BGR uint8:
 
-| Size | Frame | Write | Read, copy | Read, view | Plain memcpy |
+| Machine | Size | Write | Read, copy | Read, view | Plain memcpy |
 |---|---|---|---|---|---|
-| 720p | 2.8 MB | 340 µs | 246 µs | 2.6 µs | 225 µs |
-| 1080p | 6.2 MB | 744 µs | 589 µs | 4.9 µs | 502 µs |
-| 4K | 24.9 MB | 3.0 ms | 2.0 ms | 4.1 µs | 2.2 ms |
+| MacBook Air, Apple Silicon | 720p (2.8 MB) | 49 µs | 41 µs | 2.4 µs | 38 µs |
+| | 1080p (6.2 MB) | 109 µs | 89 µs | 2.3 µs | 87 µs |
+| | 4K (24.9 MB) | 582 µs | 496 µs | 2.4 µs | 474 µs |
+| 2-core x86 cloud VM | 720p | 340 µs | 246 µs | 2.6 µs | 225 µs |
+| | 1080p | 744 µs | 589 µs | 4.9 µs | 502 µs |
+| | 4K | 3.0 ms | 2.0 ms | 4.1 µs | 2.2 ms |
 
 A copy costs what a memcpy costs; a view costs the same at any size, because nothing moves.
 
@@ -107,7 +110,7 @@ writer in C, C++ or Rust can share rings with Python ones.
 
 ```bash
 pip install -e ".[dev]"
-pytest -q -s       # 17 tests, ~7 s; -s prints the torn-frame test's counts
+pytest -q -s       # 18 tests, ~7 s; -s prints the torn-frame test's counts
 ruff check . && ruff format --check .
 ```
 

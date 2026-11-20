@@ -36,15 +36,23 @@ def create(name: str, size: int) -> shared_memory.SharedMemory:
         return shared_memory.SharedMemory(name=name, create=True, size=size)
 
 
+_register_lock = threading.Lock()
+
+
 def attach(name: str) -> shared_memory.SharedMemory:
     """Attach without registering the segment with this process's resource tracker.
-    Before Python 3.13 the tracker unlinks every segment a process *attached to* when that
-    process exits, so a reader quitting would delete the writer's ring."""
+
+    Before Python 3.13 attaching registers the segment, and the tracker unlinks every
+    registered segment when the process exits, so a reader quitting would delete the
+    writer's ring. Unregistering afterwards is not enough: when the writer lives in the
+    same process, that also drops the writer's own registration. So registration is
+    skipped while attaching instead."""
     if sys.version_info >= (3, 13):
         return shared_memory.SharedMemory(name=name, track=False)
-    shm = shared_memory.SharedMemory(name=name)
-    try:
-        resource_tracker.unregister(shm._name, "shared_memory")  # noqa: SLF001
-    except Exception:  # tracker not running (e.g. under some process launchers)
-        pass
-    return shm
+    with _register_lock:
+        original = resource_tracker.register
+        resource_tracker.register = lambda *args, **kwargs: None
+        try:
+            return shared_memory.SharedMemory(name=name)
+        finally:
+            resource_tracker.register = original
