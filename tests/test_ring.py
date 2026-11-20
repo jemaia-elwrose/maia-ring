@@ -1,0 +1,202 @@
+import json
+import multiprocessing as mp
+import os
+import sys
+import time
+
+import numpy as np
+import pytest
+
+from maia_ring import IFRAME, FrameRef, Geometry, RingPool, RingReader, RingWriter, StaleFrame
+from maia_ring import layout as L
+
+
+@pytest.fixture
+def name(request):
+    # short and unique: macOS allows 30 characters
+    return f"t{os.getpid() % 100000}{abs(hash(request.node.name)) % 100000}"
+
+
+def frame(value, h=48, w=64, c=3):
+    return np.full((h, w, c), value % 256, np.uint8)
+
+
+def test_write_then_read_latest(name):
+    with RingWriter(name, slots=4, width=64, height=48) as w, RingReader(name) as r:
+        assert r.latest() is None
+        w.write(frame(5), flags=IFRAME, pts_ns=33)
+        f = r.latest()
+        assert f.array.shape == (48, 64, 3) and f.array.mean() == 5
+        assert f.meta.frame_index == 0 and f.meta.is_iframe and f.meta.pts_ns == 33
+        assert r.geometry == Geometry(4, 64, 48, 3, "bgr")
+
+
+def test_read_by_ref_and_stale_after_lapping(name):
+    with RingWriter(name, slots=3, width=64, height=48) as w, RingReader(name) as r:
+        ref = w.write(frame(1))
+        assert r.get(ref).array.mean() == 1
+        for i in range(3):
+            w.write(frame(10 + i))
+        with pytest.raises(StaleFrame):
+            r.get(ref)
+        assert r.latest().meta.frame_index == 3
+
+
+def test_view_reports_when_overwritten(name):
+    with RingWriter(name, slots=2, width=64, height=48) as w, RingReader(name) as r:
+        ref = w.write(frame(1))
+        view = r.get(ref, copy=False)
+        assert not view.array.flags.writeable and view.still_valid()
+        w.write(frame(2))
+        assert view.still_valid()  # other slot
+        w.write(frame(3))
+        assert not view.still_valid()  # its slot was reused
+        del view
+
+
+def test_ref_round_trips_through_json(name):
+    with RingWriter(name, slots=2, width=64, height=48) as w, RingReader(name) as r:
+        ref = w.write(frame(9))
+        back = FrameRef.from_dict(json.loads(json.dumps(ref.to_dict())))
+        assert back == ref and r.get(back).array.mean() == 9
+
+
+def test_begin_commit_in_place_and_abort(name):
+    with RingWriter(name, slots=2, width=64, height=48) as w, RingReader(name) as r:
+        view = w.begin()
+        view[:] = 4
+        del view
+        ref = w.commit(timestamp_ns=123)
+        assert r.get(ref).array.mean() == 4 and ref.timestamp_ns == 123
+        with pytest.raises(ValueError):
+            w.write(np.zeros((10, 10, 3), np.uint8))  # wrong size: aborted, nothing published
+        assert r.committed() == 1 and r.latest().meta.frame_index == 0
+        with pytest.raises(RuntimeError):
+            w.commit()
+
+
+@pytest.mark.parametrize("fmt,channels,shape", [("gray", 1, (48, 64)), ("nv12", 1, (72, 64)), ("bgra", 4, (48, 64, 4))])
+def test_pixel_formats(name, fmt, channels, shape):
+    with RingWriter(name, slots=2, width=64, height=48, channels=channels, pixfmt=fmt) as w, RingReader(name) as r:
+        w.write(np.ones(shape, np.uint8))
+        assert r.latest().array.shape == shape and r.geometry.pixfmt == fmt
+
+
+def test_slots_are_page_aligned_for_triton():
+    g = Geometry(5, 1920, 1080, 3, "bgr")
+    assert all(g.slot_offset(i) % L.PAGE == 0 for i in range(5))
+    assert g.total_bytes == g.slot_offset(4) + g.slot_stride
+
+
+def test_rejects_bad_names_and_foreign_segments(name):
+    with pytest.raises(ValueError):
+        RingWriter("x" * 31, slots=2, width=8, height=8)
+    from multiprocessing import shared_memory
+
+    other = shared_memory.SharedMemory(name=name, create=True, size=8192)
+    try:
+        with pytest.raises(ValueError, match="magic"):
+            RingReader(name)
+    finally:
+        other.close()
+        other.unlink()
+
+
+def test_wait_times_out_then_returns_new_frame(name):
+    with RingWriter(name, slots=2, width=64, height=48) as w, RingReader(name) as r:
+        assert r.wait(timeout=0.02) is None
+        w.write(frame(1))
+        assert r.wait(after=-1, timeout=1).meta.frame_index == 0
+
+
+def test_writer_restart_is_detected_and_pool_reattaches(name):
+    pool = RingPool()
+    w = RingWriter(name, slots=2, width=64, height=48)
+    old = w.write(frame(1))
+    assert pool.get(old, copy=True).array.mean() == 1
+    w.close()
+    w = RingWriter(name, slots=2, width=64, height=48)  # e.g. ingest process restarted
+    new = w.write(frame(2))
+    assert pool.reader(name).replaced()
+    assert pool.get(new.to_dict(), copy=True).array.mean() == 2
+    with pytest.raises(StaleFrame):
+        pool.get(old)
+    pool.close()
+    w.close()
+
+
+def _attach_and_exit(name):
+    RingReader(name).close()
+
+
+def test_reader_process_exit_does_not_delete_the_ring(name):
+    # before Python 3.13 the resource tracker unlinked segments that a process merely attached to
+    with RingWriter(name, slots=2, width=64, height=48) as w:
+        w.write(frame(1))
+        p = mp.get_context("spawn").Process(target=_attach_and_exit, args=(name,))
+        p.start()
+        p.join(30)
+        assert p.exitcode == 0
+        time.sleep(0.2)
+        with RingReader(name) as r:
+            assert r.latest().array.mean() == 1
+
+
+def _writer(name, seconds, ready, count):
+    with RingWriter(name, slots=3, width=320, height=240) as w:
+        ready.set()
+        deadline, i = time.monotonic() + seconds, 0
+        while time.monotonic() < deadline:
+            view = w.begin()
+            view[:] = i % 256  # a frame is uniform: any torn read shows two values
+            del view
+            w.commit()
+            i += 1
+        count.value = i
+
+
+def _reader(name, seconds, use_views, out):
+    deadline = time.monotonic() + seconds
+    ok = stale = torn = 0
+    with RingReader(name) as r:
+        while time.monotonic() < deadline:
+            try:
+                f = r.latest(copy=not use_views)
+            except StaleFrame:
+                stale += 1
+                continue
+            if f is None:
+                continue
+            a = f.array
+            lo, hi = int(a.min()), int(a.max())
+            good = lo == hi == f.meta.frame_index % 256
+            if use_views and not f.still_valid():
+                stale += 1  # caught by the check after use, as a view's user must do
+            elif good:
+                ok += 1
+            else:
+                torn += 1
+            del a, f
+    out.put((ok, stale, torn))
+
+
+@pytest.mark.parametrize("use_views", [False, True])
+def test_no_torn_frame_is_ever_reported_valid(name, use_views):
+    """A writer in one process, two readers in others, a tiny ring so the writer laps the
+    readers constantly. Every frame a reader accepts must be whole."""
+    ctx = mp.get_context("spawn")
+    ready, out, count = ctx.Event(), ctx.Queue(), ctx.Value("q", 0)
+    w = ctx.Process(target=_writer, args=(name, 2.5, ready, count))
+    w.start()
+    assert ready.wait(30)
+    readers = [ctx.Process(target=_reader, args=(name, 1.5, use_views, out)) for _ in range(2)]
+    for p in readers:
+        p.start()
+    results = [out.get(timeout=60) for _ in readers]
+    for p in [*readers, w]:
+        p.join(60)
+    ok = sum(r[0] for r in results)
+    torn = sum(r[2] for r in results)
+    stale = sum(r[1] for r in results)
+    print(f"\n  views={use_views}: {count.value} written, {ok} good, {stale} stale, {torn} torn", file=sys.stderr)
+    assert torn == 0 and ok > 0
