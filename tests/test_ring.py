@@ -202,16 +202,53 @@ def test_no_torn_frame_is_ever_reported_valid(name, use_views):
     assert torn == 0 and ok > 0
 
 
-def test_attaching_never_registers_with_the_resource_tracker(name, monkeypatch):
-    # registering then unregistering broke the writer's own registration on Python < 3.13
-    # when writer and reader share a process (KeyError printed by the tracker on close)
+def test_rings_never_touch_the_resource_tracker(name, monkeypatch):
+    # The tracker's shared bookkeeping caused KeyErrors and "leaked shared_memory" warnings
+    # when writers and readers mixed in and across processes; rings manage their own lifetime.
     from multiprocessing import resource_tracker
 
+    calls = []
+    monkeypatch.setattr(resource_tracker, "register", lambda *a, **k: calls.append(("register", a)))
+    monkeypatch.setattr(resource_tracker, "unregister", lambda *a, **k: calls.append(("unregister", a)))
+    with RingWriter(name, slots=2, width=8, height=8) as w:
+        w.write(np.zeros((8, 8, 3), np.uint8))
+        with RingReader(name) as r:
+            assert r.latest() is not None
+    assert calls == []
+
+
+def _write_then(name, how):
+    w = RingWriter(name, slots=2, width=8, height=8)
+    w.write(np.ones((8, 8, 3), np.uint8))
+    if how == "crash":
+        os._exit(1)  # no cleanup at all, like a segfault or kill -9
+    # "exit": the interpreter exits normally without close()
+
+
+def _exists(name):
     from maia_ring import _shm
 
-    with RingWriter(name, slots=2, width=8, height=8):
-        calls = []
-        monkeypatch.setattr(resource_tracker, "register", lambda *a, **k: calls.append(a))
-        monkeypatch.setattr(resource_tracker, "unregister", lambda *a, **k: calls.append(a))
+    try:
         _shm.attach(name).close()
-        assert calls == []
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def test_normal_exit_removes_the_ring_crash_leaves_it_and_rm_clears_it(name):
+    from maia_ring.cli import main
+
+    ctx = mp.get_context("spawn")
+    for how, survives in [("exit", False), ("crash", True)]:
+        p = ctx.Process(target=_write_then, args=(name, how))
+        p.start()
+        p.join(30)
+        assert _exists(name) is survives, how
+    with RingWriter(name, slots=2, width=8, height=8) as w:  # a new writer replaces the stale ring
+        with RingReader(name) as r:
+            assert r.instance == w.instance
+    p = ctx.Process(target=_write_then, args=(name, "crash"))
+    p.start()
+    p.join(30)
+    main(["rm", name])
+    assert not _exists(name)

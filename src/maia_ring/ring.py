@@ -9,6 +9,7 @@ never block the writer.
 
 from __future__ import annotations
 
+import atexit
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -77,6 +78,29 @@ def _random_instance() -> int:
     return random.SystemRandom().getrandbits(63) or 1
 
 
+def _remove_if_ours(name: str, instance: int) -> None:
+    """At interpreter exit: delete the ring unless a newer writer has replaced it."""
+    try:
+        shm = _shm.attach(name)
+    except FileNotFoundError:
+        return
+    try:
+        ours = L.INSTANCE.unpack_from(shm.buf, L.INSTANCE_OFFSET)[0] == instance
+    finally:
+        shm.close()
+    if ours:
+        _shm.remove(name)
+
+
+_OPEN_WRITERS: dict[int, tuple[str, int]] = {}  # id(writer) -> (ring name, instance)
+
+
+@atexit.register
+def _cleanup_open_writers() -> None:
+    for name, instance in list(_OPEN_WRITERS.values()):
+        _remove_if_ours(name, instance)
+
+
 class RingWriter:
     """Owns the segment. One writer per ring."""
 
@@ -98,6 +122,7 @@ class RingWriter:
         self._next = 0
         self._open: tuple[int, int, int] | None = None  # (slot, frame_index, seq) being written
         self._views = [np.ndarray(g.shape, np.uint8, self._buf, g.slot_offset(i)) for i in range(slots)]
+        _OPEN_WRITERS[id(self)] = (name, self.instance)
 
     def begin(self) -> np.ndarray:
         """Reserve the next slot and return a writable view of it, for writing a frame in
@@ -158,11 +183,9 @@ class RingWriter:
             self._shm.close()
         except BufferError as e:
             raise BufferError("close() while a view from begin() is still alive; delete it first") from e
+        _OPEN_WRITERS.pop(id(self), None)
         if unlink:
-            try:
-                self._shm.unlink()
-            except FileNotFoundError:
-                pass
+            _shm.unlink(self._shm)
 
     def __enter__(self) -> RingWriter:
         return self

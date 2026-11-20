@@ -1,12 +1,22 @@
-"""Shared-memory plumbing that the standard library gets subtly wrong for this use."""
+"""Shared-memory plumbing that the standard library gets subtly wrong for this use.
+
+maia-ring never uses Python's multiprocessing resource tracker. The tracker deletes a
+segment when *any* process that touched it exits (before Python 3.13 that includes readers),
+and its bookkeeping, shared by every process it serves, can disagree with what really exists
+(KeyErrors, "leaked shared_memory" warnings). Rings manage their own lifetime instead: the
+writer deletes its ring on close and at interpreter exit, and a new writer replaces a ring
+left behind by one that crashed.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 from multiprocessing import resource_tracker, shared_memory
 
 _fence_lock = threading.Lock()
+_tracker_lock = threading.Lock()
 
 
 def fence() -> None:
@@ -25,34 +35,54 @@ def check_name(name: str) -> str:
     return name
 
 
-def create(name: str, size: int) -> shared_memory.SharedMemory:
-    """Create a segment, replacing a stale one left behind by a crashed writer."""
-    try:
-        return shared_memory.SharedMemory(name=name, create=True, size=size)
-    except FileExistsError:
-        stale = attach(name)
-        stale.close()
-        stale.unlink()
-        return shared_memory.SharedMemory(name=name, create=True, size=size)
+@contextlib.contextmanager
+def _no_tracker():
+    """Before Python 3.13 SharedMemory always talks to the resource tracker; silence it."""
+    with _tracker_lock:
+        register, unregister = resource_tracker.register, resource_tracker.unregister
+        resource_tracker.register = resource_tracker.unregister = lambda *args, **kwargs: None
+        try:
+            yield
+        finally:
+            resource_tracker.register, resource_tracker.unregister = register, unregister
 
 
-_register_lock = threading.Lock()
+def _open(name: str, create: bool = False, size: int = 0) -> shared_memory.SharedMemory:
+    if sys.version_info >= (3, 13):
+        return shared_memory.SharedMemory(name=name, create=create, size=size, track=False)
+    with _no_tracker():
+        return shared_memory.SharedMemory(name=name, create=create, size=size)
 
 
 def attach(name: str) -> shared_memory.SharedMemory:
-    """Attach without registering the segment with this process's resource tracker.
+    return _open(name)
 
-    Before Python 3.13 attaching registers the segment, and the tracker unlinks every
-    registered segment when the process exits, so a reader quitting would delete the
-    writer's ring. Unregistering afterwards is not enough: when the writer lives in the
-    same process, that also drops the writer's own registration. So registration is
-    skipped while attaching instead."""
-    if sys.version_info >= (3, 13):
-        return shared_memory.SharedMemory(name=name, track=False)
-    with _register_lock:
-        original = resource_tracker.register
-        resource_tracker.register = lambda *args, **kwargs: None
+
+def unlink(shm: shared_memory.SharedMemory) -> None:
+    with _no_tracker():  # on 3.13 an untracked segment's unlink() skips the tracker already
         try:
-            return shared_memory.SharedMemory(name=name)
-        finally:
-            resource_tracker.register = original
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def create(name: str, size: int) -> shared_memory.SharedMemory:
+    """Create a segment, replacing a stale one left behind by a crashed writer."""
+    try:
+        return _open(name, create=True, size=size)
+    except FileExistsError:
+        stale = attach(name)
+        stale.close()
+        unlink(stale)
+        return _open(name, create=True, size=size)
+
+
+def remove(name: str) -> bool:
+    """Delete a ring by name (e.g. one left by a crashed writer). False if there was none."""
+    try:
+        shm = attach(name)
+    except FileNotFoundError:
+        return False
+    shm.close()
+    unlink(shm)
+    return True

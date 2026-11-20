@@ -2,6 +2,7 @@
 
 maia-ring bench                 # cost of writing and reading frames on this machine
 maia-ring info cam-gate-1       # header and state of a live ring
+maia-ring rm cam-gate-1         # delete a ring left behind by a crashed writer
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import time
 
 import numpy as np
 
+from . import _shm
 from .ring import RingReader, RingWriter
 
 SIZES = {"720p": (1280, 720), "1080p": (1920, 1080), "4k": (3840, 2160)}
@@ -62,7 +64,14 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--json", action="store_true")
     i = sub.add_parser("info", help="show a live ring's header and newest frame")
     i.add_argument("name")
+    rm = sub.add_parser("rm", help="delete a ring (only needed after a writer crashed)")
+    rm.add_argument("names", nargs="+")
     args = ap.parse_args(argv)
+
+    if args.cmd == "rm":
+        for name in args.names:
+            print(f"{name}: {'removed' if _shm.remove(_shm.check_name(name)) else 'not found'}")
+        return
 
     if args.cmd == "bench":
         rows = [bench_size(size, args.n) for size in args.sizes]

@@ -74,9 +74,10 @@ Details that are easy to get wrong, handled here:
   maia-ring uses a mutex lock and unlock as one. That works in practice and CI runs the
   torn-frame test on ARM macOS, but it is not a formal guarantee. A small optional C
   extension with real atomic fences is planned for 0.2.
-- **Python's resource tracker** (before 3.13) deletes shared memory that a process merely
-  attached to when that process exits. Readers detach from it, so a reader quitting never
-  deletes the writer's ring.
+- **Ring lifetime without Python's resource tracker.** The tracker deletes shared memory when
+  any process that touched it exits, and its shared bookkeeping can disagree with reality.
+  Rings skip it: the writer deletes its ring on close and at normal exit, a ring left by a
+  crashed writer is replaced by the next one, and `maia-ring rm` deletes one by hand.
 - **Writer restarts.** A new writer recreates the ring with a new instance id; readers and
   `RingPool` notice and reattach instead of reading a dead segment forever.
 - **Page-aligned slots**, so a slot can be registered with Triton's system shared memory.
@@ -99,6 +100,7 @@ A copy costs what a memcpy costs; a view costs the same at any size, because not
 ```bash
 maia-ring bench --sizes 720p 1080p 4k
 maia-ring info cam-gate-1        # a live ring: geometry, frames written, newest frame's age
+maia-ring rm cam-gate-1          # delete a ring left behind by a crashed writer
 ```
 
 ## Format
@@ -110,7 +112,7 @@ writer in C, C++ or Rust can share rings with Python ones.
 
 ```bash
 pip install -e ".[dev]"
-pytest -q -s       # 18 tests, ~7 s; -s prints the torn-frame test's counts
+pytest -q -s       # 19 tests, ~7 s; -s prints the torn-frame test's counts
 ruff check . && ruff format --check .
 ```
 
