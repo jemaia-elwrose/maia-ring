@@ -11,6 +11,7 @@ left behind by one that crashed.
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import threading
 from multiprocessing import resource_tracker, shared_memory
@@ -55,7 +56,21 @@ def _open(name: str, create: bool = False, size: int = 0) -> shared_memory.Share
 
 
 def attach(name: str) -> shared_memory.SharedMemory:
-    return _open(name)
+    try:
+        return _open(name)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"ring {name!r} belongs to another user (a writer in Docker runs as root). Let your "
+            f"group read it: start the writer with MAIA_RING_GID=$(id -g), or run both as one user"
+        ) from exc
+
+
+def share_with_group(shm: shared_memory.SharedMemory, gid: int) -> None:
+    """Mode 0660, owned by group ``gid``: members can open the ring, other users cannot."""
+    fd = shm._fd  # POSIX only, like the rest of maia-ring
+    if os.fstat(fd).st_gid != gid:
+        os.fchown(fd, -1, gid)  # root may give it to any group; others to one they belong to
+    os.fchmod(fd, 0o660)
 
 
 def unlink(shm: shared_memory.SharedMemory) -> None:

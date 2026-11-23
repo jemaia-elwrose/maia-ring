@@ -252,3 +252,53 @@ def test_normal_exit_removes_the_ring_crash_leaves_it_and_rm_clears_it(name):
     p.join(30)
     main(["rm", name])
     assert not _exists(name)
+
+
+def _segment(name):
+    return f"/dev/shm/{name}"
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="Linux /dev/shm only")
+def test_rings_are_private_unless_a_group_is_given(name, monkeypatch):
+    monkeypatch.delenv("MAIA_RING_GID", raising=False)
+    with RingWriter(name, slots=2, width=4, height=4):
+        assert os.stat(_segment(name)).st_mode & 0o777 == 0o600
+    gid = os.getgid()
+    with RingWriter(name, slots=2, width=4, height=4, group=gid):
+        st = os.stat(_segment(name))
+        assert st.st_mode & 0o777 == 0o660 and st.st_gid == gid
+    monkeypatch.setenv("MAIA_RING_GID", str(gid))
+    with RingWriter(name, slots=2, width=4, height=4):
+        assert os.stat(_segment(name)).st_mode & 0o777 == 0o660
+
+
+def _read_as(uid, gid, ring, q):
+    os.setgroups([gid])
+    os.setgid(gid)
+    os.setuid(uid)
+    try:
+        with RingReader(ring) as r:
+            q.put(("ok", int(r.latest().array[0, 0, 0])))
+    except PermissionError as exc:
+        q.put(("denied", str(exc)))
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to switch users")
+def test_a_writer_running_as_root_shares_with_a_host_user_by_group(name, monkeypatch):
+    # The Docker case: the gateway writes as root, a script on the host reads as a normal user.
+    monkeypatch.delenv("MAIA_RING_GID", raising=False)
+    user, group = 65534, 65534  # nobody / nogroup
+    ctx = mp.get_context("fork")
+    for share, expect in ((None, "denied"), (group, "ok")):
+        with RingWriter(name, slots=2, width=4, height=4, group=share) as w:
+            w.write(np.full((4, 4, 3), 7, np.uint8))
+            q = ctx.Queue()
+            p = ctx.Process(target=_read_as, args=(user, group, name, q))
+            p.start()
+            p.join(10)
+            status, detail = q.get(timeout=5)
+            assert status == expect, detail
+            if status == "denied":
+                assert "MAIA_RING_GID" in detail
+            else:
+                assert detail == 7

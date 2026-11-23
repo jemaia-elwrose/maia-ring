@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+- `RingWriter(..., group=gid)` (or `MAIA_RING_GID` in the writer's environment) lets readers
+  in that group open the ring (mode 0660). Rings stay private (0600) by default. Needed when
+  the writer runs as another user, e.g. maia-gateway in Docker (root) with readers on the host.
+- A reader denied access now says why and what to set, instead of a bare `PermissionError`.
+
 ## 0.1.2
 - Rings no longer use Python's resource tracker at all. Its bookkeeping, shared across
   processes, could print "leaked shared_memory" warnings at exit (seen on Python 3.11).

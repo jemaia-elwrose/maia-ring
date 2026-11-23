@@ -10,6 +10,7 @@ never block the writer.
 from __future__ import annotations
 
 import atexit
+import os
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -104,7 +105,21 @@ def _cleanup_open_writers() -> None:
 class RingWriter:
     """Owns the segment. One writer per ring."""
 
-    def __init__(self, name: str, *, slots: int, width: int, height: int, channels: int = 3, pixfmt: str = "bgr"):
+    def __init__(
+        self,
+        name: str,
+        *,
+        slots: int,
+        width: int,
+        height: int,
+        channels: int = 3,
+        pixfmt: str = "bgr",
+        group: int | None = None,
+    ):
+        """``group``: a group id allowed to read the ring (mode 0660). By default only the
+        writer's user can open it (0600), which stops readers running as another user, for
+        example a writer in Docker (root) and readers on the host. ``MAIA_RING_GID`` in the
+        environment sets the default."""
         if slots < 2:
             raise ValueError("a ring needs at least 2 slots")
         if pixfmt not in L.PIXFMTS:
@@ -112,6 +127,10 @@ class RingWriter:
         self.name = _shm.check_name(name)
         self.geometry = g = L.Geometry(slots, width, height, channels, pixfmt)
         self._shm = _shm.create(name, g.total_bytes)
+        if group is None and os.environ.get("MAIA_RING_GID", "").strip():
+            group = int(os.environ["MAIA_RING_GID"])
+        if group is not None:
+            _shm.share_with_group(self._shm, group)
         self._buf = self._shm.buf
         self._buf[: L.PAGE] = bytes(L.PAGE)
         self._buf[g.table_offset : g.data_offset] = bytes(g.data_offset - g.table_offset)

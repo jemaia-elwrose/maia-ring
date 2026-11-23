@@ -81,6 +81,10 @@ Details that are easy to get wrong, handled here:
 - **Writer restarts.** A new writer recreates the ring with a new instance id; readers and
   `RingPool` notice and reattach instead of reading a dead segment forever.
 - **Page-aligned slots**, so a slot can be registered with Triton's system shared memory.
+- **Private by default.** A ring can be opened only by the writer's user (mode 0600). When
+  readers run as another user, for example a writer in Docker (root) and scripts on the
+  host, give the ring to their group: `RingWriter(..., group=gid)` or `MAIA_RING_GID=$(id -g)`
+  in the writer's environment (mode 0660).
 
 ## Cost per frame
 
@@ -96,6 +100,11 @@ Details that are easy to get wrong, handled here:
 | | 4K | 3.0 ms | 2.0 ms | 4.1 µs | 2.2 ms |
 
 A copy costs what a memcpy costs; a view costs the same at any size, because nothing moves.
+
+Onto the GPU (`torch`, NVIDIA Tesla T4, PCIe 3): a ring view to GPU memory costs 0.57 ms at
+1080p and 2.1 ms at 4K; pinning the ring's pages saves 15%. The copy runs on its own engine,
+so it overlaps inference, and a detector's input is usually resized first (640×640 is 1.2 MB).
+That is why maia-ring has no GPU mode: it would save well under a millisecond per frame.
 
 ```bash
 maia-ring bench --sizes 720p 1080p 4k

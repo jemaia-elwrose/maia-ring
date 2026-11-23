@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "maia-ring"
-version = "0.1.2"
+version = "0.1.3"
 description = "Shared-memory frame ring: pass video frames between processes without copying them."
 readme = "README.md"
 license = "MIT"
